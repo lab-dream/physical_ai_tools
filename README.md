@@ -22,3 +22,29 @@ To access datasets and pre-trained models for our open-source platforms, see:
 
 To use the Docker image for running ROS packages and Physical AI tools with the AI Worker, visit:
   - [Docker Images](https://hub.docker.com/r/robotis/ros/tags)
+
+## ACT LiPo Post-Optimization
+
+LiPo post-optimization is disabled by default and only affects ACT policy inference. Other policies, such as Diffusion, pi0, pi0.5, and VLA, keep their original behavior.
+
+Start the Physical AI server first:
+
+```bash
+ros2 launch physical_ai_server physical_ai_server_bringup.launch.py
+```
+
+Enable LiPo before starting ACT inference:
+
+```bash
+ros2 param set /physical_ai_server use_lipo true
+```
+
+Disable LiPo and restore the original ACT inference behavior:
+
+```bash
+ros2 param set /physical_ai_server use_lipo false
+```
+
+The parameter is read when inference starts, so set `use_lipo` before pressing Start Inference in the UI. If `use_lipo` is true but the selected policy is not ACT, LiPo is skipped.
+
+The LeRobot submodule is not modified in this repository. Docker builds install LeRobot first, then apply the ACT-only LiPo hook to the installed LeRobot source with `physical_ai_server/scripts/apply_lerobot_act_lipo_patch.py`.

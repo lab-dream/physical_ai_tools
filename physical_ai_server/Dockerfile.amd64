@@ -42,8 +42,12 @@ RUN cd ${COLCON_WS}/src/physical_ai_tools/lerobot && \
 RUN cd ${COLCON_WS}/src/physical_ai_tools/lerobot && \
     pip install -e ".[smolvla]"
 
+RUN python3 ${COLCON_WS}/src/physical_ai_tools/physical_ai_server/scripts/apply_lerobot_act_lipo_patch.py \
+    --lerobot-root ${COLCON_WS}/src/physical_ai_tools/lerobot
+
 RUN pip install --no-cache-dir setuptools==68.1.2
 RUN pip install --no-cache-dir 'numpy<2'
+RUN pip install --no-cache-dir action-lipo osqp scipy 'numpy<2'
 
 RUN echo 'export PYTHONPATH=${COLCON_WS}/src/physical_ai_tools/lerobot/src:$PYTHONPATH' >> /root/.bashrc && \
     export PYTHONPATH=${COLCON_WS}/src/physical_ai_tools/lerobot/src:$PYTHONPATH

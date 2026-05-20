@@ -70,6 +70,17 @@ class PhysicalAIServer(Node):
     DEFAULT_TOPIC_TIMEOUT = 5.0  # seconds
     PUB_QOS_SIZE = 10
     TRAINING_STATUS_TIMER_FREQUENCY = 0.5  # seconds
+    LIPO_PARAMETER_DEFAULTS = {
+        'use_lipo': False,
+        'lipo_solver': 'osqp',
+        'lipo_blending_horizon': 10,
+        'lipo_len_time_delay': 0,
+        'lipo_epsilon_blending': 0.02,
+        'lipo_epsilon_path': 0.003,
+        'lipo_osqp_eps_abs': 1e-4,
+        'lipo_osqp_eps_rel': 1e-4,
+        'lipo_osqp_max_iter': 8000,
+    }
 
     class RosbagNotReadyException(Exception):
         """Exception raised when rosbag recording cannot start yet."""
@@ -84,6 +95,8 @@ class PhysicalAIServer(Node):
         self.total_joint_order = None
         self.on_recording = False
         self.on_inference = False
+        self.lipo_params = self._declare_lipo_parameters()
+        self._log_lipo_configuration()
 
         self.hf_cancel_on_progress = False
 
@@ -161,6 +174,35 @@ class PhysicalAIServer(Node):
             'collection': self._data_collection_timer_callback,
             'inference': self._inference_timer_callback
         }
+
+    def _declare_lipo_parameters(self):
+        for name, default_value in self.LIPO_PARAMETER_DEFAULTS.items():
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default_value)
+        return self._get_lipo_parameters()
+
+    def _get_lipo_parameters(self):
+        params = {
+            name: self.get_parameter(name).value
+            for name in self.LIPO_PARAMETER_DEFAULTS.keys()
+        }
+        return {
+            'enabled': bool(params['use_lipo']),
+            'solver': str(params['lipo_solver']),
+            'blending_horizon': int(params['lipo_blending_horizon']),
+            'len_time_delay': int(params['lipo_len_time_delay']),
+            'epsilon_blending': float(params['lipo_epsilon_blending']),
+            'epsilon_path': float(params['lipo_epsilon_path']),
+            'osqp_eps_abs': float(params['lipo_osqp_eps_abs']),
+            'osqp_eps_rel': float(params['lipo_osqp_eps_rel']),
+            'osqp_max_iter': int(params['lipo_osqp_max_iter']),
+        }
+
+    def _log_lipo_configuration(self):
+        if self.lipo_params.get('enabled', False):
+            self.get_logger().info('LiPo post-optimization: enabled for ACT')
+        else:
+            self.get_logger().info('LiPo post-optimization: disabled')
 
     def init_ros_params(self, robot_type):
         self.get_logger().info(f'Initializing ROS parameters for robot type: {robot_type}')
@@ -797,6 +839,13 @@ class PhysicalAIServer(Node):
                     response.message = result_message
                     self.get_logger().error(response.message)
                     return response
+
+                self.lipo_params = self._get_lipo_parameters()
+                self.inference_manager.configure_lipo(
+                    lipo_params=self.lipo_params,
+                    fps=task_info.fps,
+                    logger=self.get_logger()
+                )
 
                 self.init_robot_control_parameters_from_user_task(
                     task_info

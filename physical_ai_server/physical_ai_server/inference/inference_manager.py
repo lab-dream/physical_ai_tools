@@ -20,6 +20,7 @@ import os
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 import numpy as np
+from physical_ai_server.inference.act_lipo import LiPoPostOptimizer
 from physical_ai_server.utils.file_utils import read_json_file
 import torch
 
@@ -34,6 +35,10 @@ class InferenceManager:
         self.policy_type = None
         self.policy_path = None
         self.policy = None
+        self.lipo_params = {'enabled': False}
+        self.lipo_fps = None
+        self.logger = None
+        self._lipo_non_act_warned = False
 
     def validate_policy(self, policy_path: str) -> bool:
         result_message = ''
@@ -66,6 +71,7 @@ class InferenceManager:
         try:
             policy_cls = self._get_policy_class(self.policy_type)
             self.policy = policy_cls.from_pretrained(self.policy_path)
+            self._attach_lipo_to_policy()
             return True
         except Exception as e:
             print(f'Failed to load policy from {self.policy_path}: {e}')
@@ -80,6 +86,66 @@ class InferenceManager:
 
     def get_policy_config(self):
         return self.policy.config
+
+    def configure_lipo(
+            self,
+            lipo_params: dict | None = None,
+            fps: float | None = None,
+            logger=None):
+        self.lipo_params = lipo_params or {'enabled': False}
+        self.lipo_fps = fps
+        self.logger = logger
+        self._attach_lipo_to_policy()
+
+    def _attach_lipo_to_policy(self):
+        if self.policy is None:
+            return
+
+        if not self.lipo_params.get('enabled', False):
+            if hasattr(self.policy, 'act_lipo_post_optimizer'):
+                delattr(self.policy, 'act_lipo_post_optimizer')
+            return
+
+        if self.policy_type != 'act':
+            if not self._lipo_non_act_warned:
+                self._log(
+                    'warning',
+                    'LiPo post-optimization: enabled but skipped because policy is not ACT')
+                self._lipo_non_act_warned = True
+            return
+
+        dt = None
+        if self.lipo_fps is not None and self.lipo_fps > 0:
+            dt = 1.0 / float(self.lipo_fps)
+
+        self.policy.act_lipo_post_optimizer = LiPoPostOptimizer(
+            enabled=True,
+            solver=self.lipo_params.get('solver', 'osqp'),
+            blending_horizon=self.lipo_params.get('blending_horizon', 10),
+            len_time_delay=self.lipo_params.get('len_time_delay', 0),
+            dt=dt,
+            epsilon_blending=self.lipo_params.get('epsilon_blending', 0.02),
+            epsilon_path=self.lipo_params.get('epsilon_path', 0.003),
+            osqp_eps_abs=self.lipo_params.get('osqp_eps_abs', 1e-4),
+            osqp_eps_rel=self.lipo_params.get('osqp_eps_rel', 1e-4),
+            osqp_max_iter=self.lipo_params.get('osqp_max_iter', 8000),
+            logger=self.logger,
+        )
+        self._log('info', 'LiPo post-optimization: enabled for ACT')
+
+    def _log(self, level: str, message: str):
+        if self.logger is None:
+            print(message)
+            return
+
+        log_fn = getattr(self.logger, level, None)
+        if log_fn is None and level == 'warning':
+            log_fn = getattr(self.logger, 'warn', None)
+        if log_fn is None:
+            print(message)
+            return
+
+        log_fn(message)
 
     def predict(
             self,
