@@ -31,6 +31,9 @@ class InferenceManager:
             self,
             device: str = 'cuda'):
 
+        if device == 'cuda' and not torch.cuda.is_available():
+            device = 'cpu'
+
         self.device = device
         self.policy_type = None
         self.policy_path = None
