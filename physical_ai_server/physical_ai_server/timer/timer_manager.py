@@ -21,8 +21,9 @@ from rclpy.node import Node
 
 class TimerManager:
 
-    def __init__(self, node: Node):
+    def __init__(self, node: Node, callback_group=None):
         self._node = node
+        self._callback_group = callback_group
         self._timer = {}
         self._timer_frequency = {}
         self._timer_callback = {}
@@ -31,7 +32,8 @@ class TimerManager:
         if self._timer[timer_name] is None:
             self._timer[timer_name] = self._node.create_timer(
                 1.0/self._timer_frequency[timer_name],
-                self._timer_callback[timer_name])
+                self._timer_callback[timer_name],
+                callback_group=self._callback_group)
 
     def stop(self, timer_name):
         if self._timer[timer_name] is not None:

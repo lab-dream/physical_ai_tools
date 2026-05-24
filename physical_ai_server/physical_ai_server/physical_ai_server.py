@@ -51,6 +51,10 @@ from physical_ai_server.communication.communicator import Communicator
 from physical_ai_server.data_processing.data_manager import DataManager
 from physical_ai_server.data_processing.hf_api_worker import HfApiWorker
 from physical_ai_server.inference.inference_manager import InferenceManager
+from physical_ai_server.inference.spline import (
+    finite_difference_derivative,
+    quintic_spline_multi,
+)
 from physical_ai_server.timer.timer_manager import TimerManager
 from physical_ai_server.training.training_manager import TrainingManager
 from physical_ai_server.utils.parameter_utils import (
@@ -59,7 +63,10 @@ from physical_ai_server.utils.parameter_utils import (
     log_parameters,
 )
 
+import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 
@@ -71,15 +78,24 @@ class PhysicalAIServer(Node):
     PUB_QOS_SIZE = 10
     TRAINING_STATUS_TIMER_FREQUENCY = 0.5  # seconds
     LIPO_PARAMETER_DEFAULTS = {
-        'use_lipo': False,
+        'use_lipo': True,
         'lipo_solver': 'osqp',
         'lipo_blending_horizon': 10,
-        'lipo_len_time_delay': 0,
+        'lipo_len_time_delay': 5,
         'lipo_epsilon_blending': 0.02,
         'lipo_epsilon_path': 0.003,
         'lipo_osqp_eps_abs': 1e-4,
         'lipo_osqp_eps_rel': 1e-4,
         'lipo_osqp_max_iter': 8000,
+        'save_lipo_debug_actions': False,
+        'lipo_debug_save_dir': '/workspace/lipo_debug_actions',
+        'lipo_debug_save_every_n': 1,
+    }
+    ACTION_PUBLISH_PARAMETER_DEFAULTS = {
+        'action_publish_hz': 100.0,
+        'use_action_interpolation': True,
+        'interpolation_method': 'quintic_spline_multi',
+        'use_early_inference': True,
     }
 
     class RosbagNotReadyException(Exception):
@@ -92,10 +108,15 @@ class PhysicalAIServer(Node):
         self.get_logger().info('Start Physical AI Server')
 
         self.params = None
+        self.timer_callback_group = ReentrantCallbackGroup()
         self.total_joint_order = None
         self.on_recording = False
         self.on_inference = False
         self.lipo_params = self._declare_lipo_parameters()
+        self.action_publish_params = self._declare_action_publish_parameters()
+        self.action_publish_lock = threading.Lock()
+        self.inference_lock = threading.Lock()
+        self._reset_action_publish_state()
         self._log_lipo_configuration()
 
         self.hf_cancel_on_progress = False
@@ -196,6 +217,32 @@ class PhysicalAIServer(Node):
             'osqp_eps_abs': float(params['lipo_osqp_eps_abs']),
             'osqp_eps_rel': float(params['lipo_osqp_eps_rel']),
             'osqp_max_iter': int(params['lipo_osqp_max_iter']),
+            'save_debug_actions': bool(params['save_lipo_debug_actions']),
+            'debug_save_dir': str(params['lipo_debug_save_dir']),
+            'debug_save_every_n': int(params['lipo_debug_save_every_n']),
+        }
+
+    def _declare_action_publish_parameters(self):
+        for name, default_value in self.ACTION_PUBLISH_PARAMETER_DEFAULTS.items():
+            if not self.has_parameter(name):
+                self.declare_parameter(name, default_value)
+        return self._get_action_publish_parameters()
+
+    def _get_action_publish_parameters(self):
+        params = {
+            name: self.get_parameter(name).value
+            for name in self.ACTION_PUBLISH_PARAMETER_DEFAULTS.keys()
+        }
+        action_publish_hz = float(params['action_publish_hz'])
+        if action_publish_hz <= 0:
+            self.get_logger().warning(
+                'action_publish_hz must be positive; falling back to 100.0 Hz')
+            action_publish_hz = 100.0
+        return {
+            'action_publish_hz': action_publish_hz,
+            'use_action_interpolation': bool(params['use_action_interpolation']),
+            'interpolation_method': str(params['interpolation_method']),
+            'use_early_inference': bool(params['use_early_inference']),
         }
 
     def _log_lipo_configuration(self):
@@ -203,6 +250,30 @@ class PhysicalAIServer(Node):
             self.get_logger().info('LiPo post-optimization: enabled for ACT')
         else:
             self.get_logger().info('LiPo post-optimization: disabled')
+
+    def _reset_action_publish_state(self):
+        self.policy_inference_hz = 0.0
+        self.action_publish_hz = self.action_publish_params['action_publish_hz']
+        self.use_action_interpolation = self.action_publish_params[
+            'use_action_interpolation']
+        self.interpolation_method = self.action_publish_params['interpolation_method']
+        self.use_early_inference = self.action_publish_params['use_early_inference']
+        self.latest_action_chunk = None
+        self.latest_action_chunk_id = 0
+        self.current_action_pva = None
+        self.next_action_pva = None
+        self.action_step_counter = 0
+        self.action_t_in_step = 0.0
+        self.action_x0 = None
+        self.action_x1 = None
+        self.last_action_publish_time = None
+        self.action_chunk_request_pending = False
+        self.action_chunk_request_reason = ''
+        self.action_chunk_request_count = 0
+        self.last_published_action = None
+        self._logged_action_publish_config = False
+        self._logged_action_chunk_shape = False
+        self._logged_early_inference_config = False
 
     def init_ros_params(self, robot_type):
         self.get_logger().info(f'Initializing ROS parameters for robot type: {robot_type}')
@@ -262,7 +333,9 @@ class PhysicalAIServer(Node):
         )
 
         if self.heartbeat_timer is None:
-            self.heartbeat_timer = TimerManager(node=self)
+            self.heartbeat_timer = TimerManager(
+                node=self,
+                callback_group=self.timer_callback_group)
             self.heartbeat_timer.set_timer(
                 timer_name='heartbeat',
                 timer_frequency=1.0,
@@ -308,15 +381,70 @@ class PhysicalAIServer(Node):
         )
         self.communicator.clear_latest_data()
 
-        self.timer_manager = TimerManager(node=self)
+        timer_frequency = float(task_info.fps)
+        if timer_frequency <= 0:
+            timer_frequency = 30.0
+            self.get_logger().warning(
+                'task_info.fps must be positive; falling back to 30.0 Hz')
+
+        self.timer_manager = TimerManager(
+            node=self,
+            callback_group=self.timer_callback_group)
         self.timer_manager.set_timer(
             timer_name=self.operation_mode,
-            timer_frequency=task_info.fps,
+            timer_frequency=timer_frequency,
             callback_function=self.timer_callback_dict[self.operation_mode]
         )
+
+        if self.operation_mode == 'inference':
+            self.action_publish_params = self._get_action_publish_parameters()
+            self._reset_action_publish_state()
+            self.policy_inference_hz = timer_frequency
+            if self.use_action_interpolation and self.use_early_inference:
+                self._request_action_chunk_inference(reason='initial')
+
         self.timer_manager.start(timer_name=self.operation_mode)
+
+        if self.operation_mode == 'inference':
+            if self.use_action_interpolation:
+                self.timer_manager.set_timer(
+                    timer_name='action_publish',
+                    timer_frequency=self.action_publish_hz,
+                    callback_function=self._action_publish_timer_callback
+                )
+                self.timer_manager.start(timer_name='action_publish')
+            self._log_action_publish_configuration()
+
         self.get_logger().info(
             'Robot control parameters initialized successfully')
+
+    def _log_action_publish_configuration(self):
+        publish_topics = [
+            topic
+            for name, topic in self.communicator.joint_topics.items()
+            if 'leader' in name.lower()
+        ]
+        if self.use_action_interpolation:
+            self.get_logger().info('Action interpolation publisher: enabled')
+        else:
+            self.get_logger().info('Action interpolation publisher: disabled')
+        self.get_logger().info(
+            'policy_inference_hz='
+            f'{self.policy_inference_hz}, action_publish_hz={self.action_publish_hz}, '
+            f'use_lipo={self.lipo_params.get("enabled", False)}, '
+            f'use_action_interpolation={self.use_action_interpolation}, '
+            f'use_early_inference={self.use_early_inference}, '
+            f'early_inference_horizon='
+            f'{self.lipo_params.get("blending_horizon", 0)}, '
+            f'interpolation_method={self.interpolation_method}, '
+            f'publish topic list={publish_topics}')
+
+    def _stop_operation_timers(self):
+        if self.timer_manager is None:
+            return
+        for timer_name in ('inference', 'collection', 'action_publish'):
+            if timer_name in self.timer_manager._timer:
+                self.timer_manager.stop(timer_name)
 
     def clear_parameters(self):
         if self.communicator is not None:
@@ -324,6 +452,7 @@ class PhysicalAIServer(Node):
             self.communicator = None
 
         if self.timer_manager is not None:
+            self.timer_manager.stop_all()
             self.timer_manager = None
 
         if self.heartbeat_timer is not None:
@@ -557,16 +686,31 @@ class PhysicalAIServer(Node):
             return
 
     def _inference_timer_callback(self):
+        if not self.on_inference:
+            return
+        if self.use_action_interpolation and self.use_early_inference:
+            with self.action_publish_lock:
+                if not self.action_chunk_request_pending:
+                    return
+
+        if not self.inference_lock.acquire(blocking=False):
+            return
+        try:
+            self._run_inference_once()
+        finally:
+            self.inference_lock.release()
+
+    def _run_inference_once(self):
         error_msg = ''
         current_status = TaskStatus()
         camera_msgs, follower_msgs, _ = self.communicator.get_latest_data()
         if (camera_msgs is None or
                 len(camera_msgs) != len(self.params['camera_topic_list'])):
             self.get_logger().info('Waiting for camera data...')
-            return
+            return False
         elif follower_msgs is None:
             self.get_logger().info('Waiting for follower data...')
-            return
+            return False
 
         try:
             camera_data, follower_data, _ = self.data_manager.convert_msgs_to_raw_datas(
@@ -580,13 +724,13 @@ class PhysicalAIServer(Node):
             current_status.error = error_msg
             self.communicator.publish_status(status=current_status)
             self.inference_manager.clear_policy()
-            self.timer_manager.stop(timer_name=self.operation_mode)
-            return
+            self._stop_operation_timers()
+            return False
 
         if self.inference_manager.policy is None:
             if not self.inference_manager.load_policy():
                 self.get_logger().error('Failed to load policy')
-                return
+                return False
 
         try:
             if not self.on_inference:
@@ -595,30 +739,38 @@ class PhysicalAIServer(Node):
                 current_status.phase = TaskStatus.READY
                 self.communicator.publish_status(status=current_status)
                 self.inference_manager.clear_policy()
-                self.timer_manager.stop(timer_name=self.operation_mode)
-                return
+                self._stop_operation_timers()
+                return False
 
-            action = self.inference_manager.predict(
-                images=camera_data,
-                state=follower_data,
-                task_instruction=self.task_instruction[0]
-            )
+            if self.use_action_interpolation:
+                action_chunk = self.inference_manager.predict_action_chunk(
+                    images=camera_data,
+                    state=follower_data,
+                    task_instruction=self.task_instruction[0]
+                )
+                self._update_action_chunk(action_chunk)
+            else:
+                action = self.inference_manager.predict(
+                    images=camera_data,
+                    state=follower_data,
+                    task_instruction=self.task_instruction[0]
+                )
+                self.get_logger().info(
+                    f'Action data: {action}')
 
-            self.get_logger().info(
-                f'Action data: {action}')
+                action_pub_msgs = self.data_manager.data_converter.tensor_array2joint_msgs(
+                    action,
+                    self.joint_topic_types,
+                    self.joint_order
+                )
 
-            action_pub_msgs = self.data_manager.data_converter.tensor_array2joint_msgs(
-                action,
-                self.joint_topic_types,
-                self.joint_order
-            )
-
-            self.communicator.publish_action(
-                joint_msg_datas=action_pub_msgs
-            )
+                self.communicator.publish_action(
+                    joint_msg_datas=action_pub_msgs
+                )
             current_status = self.data_manager.get_current_record_status()
             current_status.phase = TaskStatus.INFERENCING
             self.communicator.publish_status(status=current_status)
+            return True
 
         except Exception as e:
             self.get_logger().error(f'Inference failed, please check : {str(e)}')
@@ -630,8 +782,223 @@ class PhysicalAIServer(Node):
             current_status.error = error_msg
             self.communicator.publish_status(status=current_status)
             self.inference_manager.clear_policy()
-            self.timer_manager.stop(timer_name=self.operation_mode)
+            self._stop_operation_timers()
+            return False
+
+    def _request_action_chunk_inference(self, reason: str) -> bool:
+        with self.action_publish_lock:
+            if self.action_chunk_request_pending:
+                return False
+            self.action_chunk_request_pending = True
+            self.action_chunk_request_reason = reason
+            self.action_chunk_request_count += 1
+            request_count = self.action_chunk_request_count
+
+        self.get_logger().info(
+            'Early inference request: '
+            f'reason={reason}, request_count={request_count}')
+        return True
+
+    def _mark_action_chunk_request_locked(self, reason: str) -> bool:
+        if self.action_chunk_request_pending:
+            return False
+        self.action_chunk_request_pending = True
+        self.action_chunk_request_reason = reason
+        self.action_chunk_request_count += 1
+        return True
+
+    def _update_action_chunk(self, action_chunk):
+        action_chunk = np.asarray(action_chunk, dtype=np.float32)
+        if action_chunk.ndim == 1:
+            action_chunk = np.expand_dims(action_chunk, axis=0)
+        if action_chunk.ndim != 2:
+            raise ValueError(f'Expected action chunk rank 2, got shape {action_chunk.shape}')
+
+        action_pva = self._build_action_pva(action_chunk)
+        with self.action_publish_lock:
+            self.latest_action_chunk = action_chunk
+            self.latest_action_chunk_id += 1
+            if self.current_action_pva is None or not self.use_early_inference:
+                self.current_action_pva = action_pva
+                self.next_action_pva = None
+                self.action_step_counter = 0
+                self.action_t_in_step = 0.0
+                self.action_x0 = action_pva[0].copy()
+                self.action_x1 = action_pva[0].copy()
+                self.last_action_publish_time = None
+                slot = 'current'
+            else:
+                self.next_action_pva = action_pva
+                slot = 'next'
+            self.action_chunk_request_pending = False
+            self.action_chunk_request_reason = ''
+
+        if not self._logged_action_chunk_shape:
+            self.get_logger().info(
+                'Action chunk received: '
+                f'chunk_size={action_chunk.shape[0]}, '
+                f'action_dim={action_chunk.shape[1]}, '
+                f'interpolation_method={self.interpolation_method}')
+            self._logged_action_chunk_shape = True
+
+        self.get_logger().info(
+            'Action chunk buffered: '
+            f'slot={slot}, chunk_id={self.latest_action_chunk_id}, '
+            f'chunk_size={action_chunk.shape[0]}, action_dim={action_chunk.shape[1]}')
+
+    def _build_action_pva(self, action_chunk: np.ndarray) -> np.ndarray:
+        policy_dt = self._get_policy_dt()
+        velocity_chunk = finite_difference_derivative(action_chunk, 1, policy_dt, 0)
+        acceleration_chunk = finite_difference_derivative(
+            velocity_chunk,
+            1,
+            policy_dt,
+            0)
+        return np.stack(
+            (action_chunk, velocity_chunk, acceleration_chunk),
+            axis=1).astype(np.float64, copy=False)
+
+    def _get_policy_dt(self) -> float:
+        if self.policy_inference_hz > 0:
+            return 1.0 / float(self.policy_inference_hz)
+        return 1.0 / 30.0
+
+    def _get_early_inference_horizon(self, chunk_size: int) -> int:
+        horizon = int(self.lipo_params.get('blending_horizon', 0))
+        if chunk_size <= 1:
+            return 0
+        return min(max(horizon, 1), chunk_size - 1)
+
+    def _action_publish_timer_callback(self):
+        if not self.on_inference or not self.use_action_interpolation:
             return
+        if self.communicator is None or self.data_manager is None:
+            return
+
+        now = time.perf_counter()
+        request_reason = None
+        with self.action_publish_lock:
+            if self.current_action_pva is None:
+                if not self.action_chunk_request_pending:
+                    request_reason = 'initial_wait'
+                    self._mark_action_chunk_request_locked(request_reason)
+                action = None
+            else:
+                if self.last_action_publish_time is None:
+                    elapsed_s = 0.0
+                else:
+                    elapsed_s = max(0.0, now - self.last_action_publish_time)
+                self.last_action_publish_time = now
+                self.action_t_in_step += elapsed_s
+
+                policy_dt = self._get_policy_dt()
+                while self.action_t_in_step >= policy_dt:
+                    self.action_t_in_step -= policy_dt
+                    if self._advance_action_step_locked():
+                        request_reason = 'prefetch'
+
+                action = self._compute_spline_action_at_t_locked(
+                    self.action_t_in_step)
+
+        if request_reason:
+            self.get_logger().info(
+                'Early inference request: '
+                f'reason={request_reason}, '
+                f'step_counter={self.action_step_counter}, '
+                f'chunk_id={self.latest_action_chunk_id}')
+
+        if action is None:
+            return
+
+        action_pub_msgs = self.data_manager.data_converter.tensor_array2joint_msgs(
+            action,
+            self.joint_topic_types,
+            self.joint_order
+        )
+        self.communicator.publish_action(joint_msg_datas=action_pub_msgs)
+        self.last_published_action = action
+
+    def _advance_action_step_locked(self) -> bool:
+        if self.current_action_pva is None:
+            return False
+
+        self.action_step_counter += 1
+        chunk_size = self.current_action_pva.shape[0]
+        horizon = self._get_early_inference_horizon(chunk_size)
+        prefetch_idx = max(chunk_size - horizon, 1)
+        requested = False
+
+        if (self.use_early_inference and
+                self.action_step_counter == prefetch_idx):
+            requested = self._mark_action_chunk_request_locked('prefetch')
+
+        if self.action_step_counter > prefetch_idx:
+            if self.next_action_pva is not None:
+                self.action_step_counter -= prefetch_idx
+                self.current_action_pva = self.next_action_pva
+                self.next_action_pva = None
+                self.get_logger().info(
+                    'Early inference chunk swap: '
+                    f'overlap_step={self.action_step_counter}, '
+                    f'prefetch_idx={prefetch_idx}, horizon={horizon}')
+            else:
+                self.action_step_counter = min(
+                    self.action_step_counter,
+                    chunk_size - 1)
+
+        idx = min(self.action_step_counter, self.current_action_pva.shape[0] - 1)
+        next_endpoint = self.current_action_pva[idx]
+        if self.action_x1 is None:
+            self.action_x0 = next_endpoint.copy()
+            self.action_x1 = next_endpoint.copy()
+        else:
+            self.action_x0 = self.action_x1.copy()
+            self.action_x1 = next_endpoint.copy()
+
+        if not self._logged_early_inference_config:
+            self.get_logger().info(
+                'Early inference publisher: '
+                f'enabled={self.use_early_inference}, '
+                f'prefetch_idx={prefetch_idx}, '
+                f'blending_horizon={horizon}, '
+                f'policy_dt={self._get_policy_dt()}')
+            self._logged_early_inference_config = True
+
+        return requested
+
+    def _compute_spline_action_at_t_locked(self, t: float):
+        if self.action_x0 is None or self.action_x1 is None:
+            return None
+
+        x0_pos = self.action_x0[0]
+        x0_vel = self.action_x0[1]
+        x0_acc = self.action_x0[2]
+        x1_pos = self.action_x1[0]
+        x1_vel = self.action_x1[1]
+        x1_acc = self.action_x1[2]
+        policy_dt = self._get_policy_dt()
+
+        method = self.interpolation_method.lower()
+        if method in ('quintic_spline_multi', 'quintic_spline', 'quintic'):
+            spline_action = quintic_spline_multi(
+                max(0.0, min(policy_dt, float(t))),
+                0.0,
+                policy_dt,
+                x0_pos,
+                x0_vel,
+                x0_acc,
+                x1_pos,
+                x1_vel,
+                x1_acc)
+            return spline_action[0].astype(np.float32, copy=False)
+
+        if method == 'linear':
+            alpha = max(0.0, min(1.0, float(t) / policy_dt))
+            return ((1.0 - alpha) * x0_pos + alpha * x1_pos).astype(
+                np.float32,
+                copy=False)
+
+        return x1_pos.astype(np.float32, copy=False)
 
     def user_training_interaction_callback(self, request, response):
         """
@@ -865,6 +1232,9 @@ class PhysicalAIServer(Node):
                     if request.command == SendCommand.Request.STOP:
                         self.get_logger().info('Stopping recording')
                         self.data_manager.record_stop()
+                        if self.on_inference:
+                            self.on_inference = False
+                            self._stop_operation_timers()
                         response.success = True
                         response.message = 'Recording stopped'
 
@@ -887,6 +1257,7 @@ class PhysicalAIServer(Node):
                         self.get_logger().info('Terminating all operations')
                         self.data_manager.record_finish()
                         self.on_inference = False
+                        self._stop_operation_timers()
                         response.success = True
                         response.message = 'All operations terminated'
 
@@ -1373,13 +1744,16 @@ class PhysicalAIServer(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = PhysicalAIServer()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         # Cleanup HF API Worker before destroying node
         node._cleanup_hf_api_worker()
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

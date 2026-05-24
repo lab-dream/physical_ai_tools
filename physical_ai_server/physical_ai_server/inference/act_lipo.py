@@ -26,10 +26,10 @@ class LiPoPostOptimizer:
 
     def __init__(
             self,
-            enabled: bool = False,
+            enabled: bool = True,
             solver: str = 'osqp',
             blending_horizon: int = 10,
-            len_time_delay: int = 0,
+            len_time_delay: int = 5,
             dt: float | None = None,
             epsilon_blending: float = 0.02,
             epsilon_path: float = 0.003,

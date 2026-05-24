@@ -16,7 +16,10 @@
 #
 # Author: Dongyun Kim
 
+import json
 import os
+from pathlib import Path
+import time
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 import numpy as np
@@ -42,6 +45,11 @@ class InferenceManager:
         self.lipo_fps = None
         self.logger = None
         self._lipo_non_act_warned = False
+        self.lipo_debug_save_dir = None
+        self.lipo_debug_save_every_n = 1
+        self.lipo_debug_chunk_count = 0
+        self.lipo_debug_raw_chunks = []
+        self.lipo_debug_optimized_chunks = []
 
     def validate_policy(self, policy_path: str) -> bool:
         result_message = ''
@@ -98,7 +106,26 @@ class InferenceManager:
         self.lipo_params = lipo_params or {'enabled': False}
         self.lipo_fps = fps
         self.logger = logger
+        self._configure_lipo_debug_saving()
         self._attach_lipo_to_policy()
+
+    def _configure_lipo_debug_saving(self):
+        self.lipo_debug_chunk_count = 0
+        self.lipo_debug_raw_chunks = []
+        self.lipo_debug_optimized_chunks = []
+        if not self.lipo_params.get('save_debug_actions', False):
+            self.lipo_debug_save_dir = None
+            return
+
+        save_dir = Path(self.lipo_params.get('debug_save_dir') or '/workspace/lipo_debug_actions')
+        save_dir.mkdir(parents=True, exist_ok=True)
+        self.lipo_debug_save_dir = save_dir
+        self.lipo_debug_save_every_n = max(
+            1,
+            int(self.lipo_params.get('debug_save_every_n', 1)))
+        self._log(
+            'info',
+            f'LiPo debug action npy saving: enabled, save_dir={save_dir}')
 
     def _attach_lipo_to_policy(self):
         if self.policy is None:
@@ -159,9 +186,125 @@ class InferenceManager:
         observation = self._preprocess(images, state, task_instruction)
         with torch.inference_mode():
             action = self.policy.select_action(observation)
-            action = action.squeeze(0).to('cpu').numpy()
+            action = action.squeeze(0).detach().cpu().numpy()
 
         return action
+
+    def predict_action_chunk(
+            self,
+            images: dict[str, np.ndarray],
+            state: list[float],
+            task_instruction: str = None) -> np.ndarray:
+
+        if self.policy_type != 'act' or not hasattr(self.policy, 'predict_action_chunk'):
+            single_action = self.predict(images, state, task_instruction)
+            return np.expand_dims(single_action, axis=0)
+
+        observation = self._preprocess(images, state, task_instruction)
+        with torch.inference_mode():
+            raw_action_chunk = self.policy.predict_action_chunk(observation)
+            optimized_action_chunk = self._maybe_apply_lipo_to_action_chunk(
+                raw_action_chunk)
+            self._save_lipo_debug_action_chunks(
+                raw_action_chunk,
+                optimized_action_chunk)
+            action_chunk = optimized_action_chunk.squeeze(0).detach().cpu().numpy()
+
+        return action_chunk
+
+    def _maybe_apply_lipo_to_action_chunk(self, action_chunk):
+        lipo_post_optimizer = getattr(self.policy, 'act_lipo_post_optimizer', None)
+        if lipo_post_optimizer is None:
+            return action_chunk
+
+        return lipo_post_optimizer.maybe_optimize(
+            action_chunk,
+            policy_name_or_type=self.policy_type,
+            fps=self.lipo_fps,
+        )
+
+    def _save_lipo_debug_action_chunks(self, raw_action_chunk, optimized_action_chunk):
+        if self.lipo_debug_save_dir is None:
+            return
+
+        raw_np = self._action_chunk_to_numpy(raw_action_chunk)
+        optimized_np = self._action_chunk_to_numpy(optimized_action_chunk)
+        if raw_np is None or optimized_np is None:
+            return
+        if raw_np.shape != optimized_np.shape:
+            self._log(
+                'warning',
+                'LiPo debug action saving skipped: raw and optimized shapes differ '
+                f'({raw_np.shape} != {optimized_np.shape})')
+            return
+
+        self.lipo_debug_chunk_count += 1
+        self.lipo_debug_raw_chunks.append(raw_np)
+        self.lipo_debug_optimized_chunks.append(optimized_np)
+
+        if self.lipo_debug_chunk_count % self.lipo_debug_save_every_n != 0:
+            return
+
+        raw_stack = np.stack(self.lipo_debug_raw_chunks, axis=0)
+        optimized_stack = np.stack(self.lipo_debug_optimized_chunks, axis=0)
+        raw_flat = raw_stack.reshape((-1, raw_stack.shape[-1]))
+        optimized_flat = optimized_stack.reshape((-1, optimized_stack.shape[-1]))
+
+        save_dir = self.lipo_debug_save_dir
+        np.save(save_dir / 'raw_action_chunks.npy', raw_stack)
+        np.save(save_dir / 'optimized_action_chunks.npy', optimized_stack)
+        np.save(save_dir / 'log_inference_actions_raw.npy', raw_flat)
+        np.save(save_dir / 'log_inference_actions_optimized.npy', optimized_flat)
+        np.save(save_dir / 'log_inference_actions.npy', raw_flat)
+        metadata = {
+            'created_unix_s': time.time(),
+            'num_chunks': int(raw_stack.shape[0]),
+            'chunk_size': int(raw_stack.shape[1]),
+            'action_dim': int(raw_stack.shape[2]),
+            'fps': float(self.lipo_fps) if self.lipo_fps else None,
+            'solver': self.lipo_params.get('solver', 'osqp'),
+            'blending_horizon': int(self.lipo_params.get('blending_horizon', 10)),
+            'len_time_delay': int(self.lipo_params.get('len_time_delay', 0)),
+            'epsilon_blending': float(
+                self.lipo_params.get('epsilon_blending', 0.02)),
+            'epsilon_path': float(self.lipo_params.get('epsilon_path', 0.003)),
+            'flat_raw_file': 'log_inference_actions_raw.npy',
+            'flat_optimized_file': 'log_inference_actions_optimized.npy',
+            'notebook_compatible_raw_file': 'log_inference_actions.npy',
+        }
+        (save_dir / 'metadata.json').write_text(json.dumps(metadata, indent=2))
+
+        self._log(
+            'info',
+            'LiPo debug action npy saved: '
+            f'save_dir={save_dir}, num_chunks={raw_stack.shape[0]}, '
+            f'chunk_size={raw_stack.shape[1]}, action_dim={raw_stack.shape[2]}')
+
+    def _action_chunk_to_numpy(self, action_chunk):
+        if hasattr(action_chunk, 'detach'):
+            action_np = action_chunk.detach().cpu().numpy()
+        elif isinstance(action_chunk, np.ndarray):
+            action_np = action_chunk
+        else:
+            self._log(
+                'warning',
+                f'LiPo debug action saving supports tensors/ndarrays only. Got {type(action_chunk)}.')
+            return None
+
+        if action_np.ndim == 3:
+            if action_np.shape[0] != 1:
+                self._log(
+                    'warning',
+                    'LiPo debug action saving supports batch size 1 only.')
+                return None
+            action_np = action_np[0]
+        elif action_np.ndim != 2:
+            self._log(
+                'warning',
+                f'LiPo debug action saving expected rank 2 or 3, got {action_np.shape}.')
+            return None
+
+        return np.asarray(action_np, dtype=np.float32).copy()
 
     def _preprocess(
             self,

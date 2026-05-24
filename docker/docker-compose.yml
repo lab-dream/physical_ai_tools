@@ -11,7 +11,7 @@ services:
     container_name: physical_ai_server
     image: robotis/physical-ai-server:0.8.3
     tty: true
-    restart: always
+    restart: no
     cap_add:
       - SYS_NICE
     ulimits:
@@ -29,6 +29,7 @@ services:
       - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
       - ../:/root/ros2_ws/src/physical_ai_tools/
       - ./huggingface:/root/.cache/huggingface
+      - ../../100000:/root/.cache/huggingface/lerobot/100000:ro
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
       - /var/run/robotis/agent_sockets/physical_ai_server:/var/run/agent
