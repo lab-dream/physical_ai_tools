@@ -1,6 +1,6 @@
 services:
   physical_ai_manager:
-    container_name: physical_ai_manager
+    container_name: physical_ai_manager_lipo
     image: robotis/physical-ai-manager:latest
     build:
       context: ../physical_ai_manager
@@ -8,7 +8,7 @@ services:
     network_mode: host
     restart: unless-stopped
   physical_ai_server:
-    container_name: physical_ai_server
+    container_name: physical_ai_server_lipo
     image: robotis/physical-ai-server:latest
     tty: true
     restart: no
@@ -32,7 +32,7 @@ services:
       - ../../100000:/root/.cache/huggingface/lerobot/100000:ro
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
-      - /var/run/robotis/agent_sockets/physical_ai_server:/var/run/agent
+      - /var/run/robotis/agent_sockets/physical_ai_server_lipo:/var/run/agent
     privileged: true
     runtime: nvidia
     deploy:
