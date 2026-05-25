@@ -1,15 +1,15 @@
 services:
-  physical_ai_manager:
+  physical_ai_manager_lipo:
     container_name: physical_ai_manager_lipo
-    image: robotis/physical-ai-manager:latest
+    image: robotis/physical-ai-manager-lipo:latest
     build:
       context: ../physical_ai_manager
       dockerfile: Dockerfile
     network_mode: host
     restart: unless-stopped
-  physical_ai_server:
+  physical_ai_server_lipo:
     container_name: physical_ai_server_lipo
-    image: robotis/physical-ai-server:latest
+    image: robotis/physical-ai-server-lipo:latest
     tty: true
     restart: no
     cap_add:
@@ -24,11 +24,11 @@ services:
       - QT_X11_NO_MITSHM=1
     volumes:
       - /dev:/dev
-      - ./workspace:/workspace
+      - ./workspace_lipo:/workspace
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
       - ../:/root/ros2_ws/src/physical_ai_tools/
-      - ./huggingface:/root/.cache/huggingface
+      - ./huggingface_lipo:/root/.cache/huggingface
       - ../../100000:/root/.cache/huggingface/lerobot/100000:ro
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro

@@ -2,7 +2,7 @@
 
 # Get the directory where the script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-CONTAINER_NAME="physical_ai_server"
+CONTAINER_NAME="physical_ai_server_lipo"
 
 # Function to display help
 show_help() {
@@ -30,13 +30,13 @@ start_container() {
         echo "Warning: DISPLAY environment variable is not set. X11 forwarding will not be available."
     fi
 
-    echo "Starting physical_ai_server container..."
+    echo "Starting physical_ai_server_lipo container..."
 
-    # Pull the latest images
-    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" pull
+    # Pull remote images when available; local lipo images can still be built below.
+    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" pull --ignore-pull-failures
 
     # Run docker-compose
-    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d
+    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d --build
 }
 
 # Function to enter the container

@@ -95,7 +95,6 @@ class PhysicalAIServer(Node):
         'action_publish_hz': 100.0,
         'use_action_interpolation': True,
         'interpolation_method': 'quintic_spline_multi',
-        'use_early_inference': True,
     }
 
     class RosbagNotReadyException(Exception):
@@ -242,8 +241,19 @@ class PhysicalAIServer(Node):
             'action_publish_hz': action_publish_hz,
             'use_action_interpolation': bool(params['use_action_interpolation']),
             'interpolation_method': str(params['interpolation_method']),
-            'use_early_inference': bool(params['use_early_inference']),
+            'use_early_inference': self._is_lipo_early_inference_enabled(),
         }
+
+    def _is_lipo_early_inference_enabled(self):
+        if not self.lipo_params.get('enabled', False):
+            return False
+
+        inference_manager = getattr(self, 'inference_manager', None)
+        policy_type = getattr(inference_manager, 'policy_type', None)
+        if policy_type is not None and policy_type != 'act':
+            return False
+
+        return True
 
     def _log_lipo_configuration(self):
         if self.lipo_params.get('enabled', False):
@@ -433,7 +443,8 @@ class PhysicalAIServer(Node):
             f'{self.policy_inference_hz}, action_publish_hz={self.action_publish_hz}, '
             f'use_lipo={self.lipo_params.get("enabled", False)}, '
             f'use_action_interpolation={self.use_action_interpolation}, '
-            f'use_early_inference={self.use_early_inference}, '
+            f'use_early_inference={self.use_early_inference} '
+            '(controlled_by=use_lipo), '
             f'early_inference_horizon='
             f'{self.lipo_params.get("blending_horizon", 0)}, '
             f'interpolation_method={self.interpolation_method}, '
