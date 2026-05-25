@@ -11,7 +11,7 @@ services:
     container_name: physical_ai_server_lipo
     image: robotis/physical-ai-server:latest
     tty: true
-    restart: no
+    restart: always
     cap_add:
       - SYS_NICE
     ulimits:
