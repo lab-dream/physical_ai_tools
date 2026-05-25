@@ -21,7 +21,6 @@ import os
 from pathlib import Path
 import time
 
-from lerobot.policies.pretrained import PreTrainedPolicy
 import numpy as np
 from physical_ai_server.inference.act_lipo import LiPoPostOptimizer
 from physical_ai_server.utils.file_utils import read_json_file
@@ -349,40 +348,54 @@ class InferenceManager:
 
         return tensor_data
 
-    def _get_policy_class(self, name: str) -> PreTrainedPolicy:
-        if name == 'tdmpc':
-            from lerobot.policies.tdmpc.modeling_tdmpc import TDMPCPolicy
+    def _get_policy_class(self, name: str):
+        import importlib
 
-            return TDMPCPolicy
-        elif name == 'diffusion':
-            from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-
-            return DiffusionPolicy
-        elif name == 'act':
-            from lerobot.policies.act.modeling_act import ACTPolicy
-
-            return ACTPolicy
-        elif name == 'vqbet':
-            from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
-
-            return VQBeTPolicy
-        elif name == 'pi0':
-            from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-
-            return PI0Policy
-        elif name == 'pi0fast':
-            from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy
-            return PI0FASTPolicy
-        elif name == 'smolvla':
-            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-            return SmolVLAPolicy
-        # TODO: Uncomment when GrootN1Policy is implemented
-        # elif name == 'groot-n1':
-        #     from Isaac.groot_n1.policies.groot_n1 import GrootN1Policy
-        #     return GrootN1Policy
-        else:
+        policy_imports = {
+            'tdmpc': (
+                ('lerobot.policies.tdmpc.modeling_tdmpc', 'TDMPCPolicy'),
+                ('lerobot.common.policies.tdmpc.modeling_tdmpc', 'TDMPCPolicy'),
+            ),
+            'diffusion': (
+                ('lerobot.policies.diffusion.modeling_diffusion', 'DiffusionPolicy'),
+                ('lerobot.common.policies.diffusion.modeling_diffusion', 'DiffusionPolicy'),
+            ),
+            'act': (
+                ('lerobot.policies.act.modeling_act', 'ACTPolicy'),
+                ('lerobot.common.policies.act.modeling_act', 'ACTPolicy'),
+            ),
+            'vqbet': (
+                ('lerobot.policies.vqbet.modeling_vqbet', 'VQBeTPolicy'),
+                ('lerobot.common.policies.vqbet.modeling_vqbet', 'VQBeTPolicy'),
+            ),
+            'pi0': (
+                ('lerobot.policies.pi0.modeling_pi0', 'PI0Policy'),
+                ('lerobot.common.policies.pi0.modeling_pi0', 'PI0Policy'),
+            ),
+            'pi0fast': (
+                ('lerobot.policies.pi0fast.modeling_pi0fast', 'PI0FASTPolicy'),
+                ('lerobot.common.policies.pi0fast.modeling_pi0fast', 'PI0FASTPolicy'),
+            ),
+            'smolvla': (
+                ('lerobot.policies.smolvla.modeling_smolvla', 'SmolVLAPolicy'),
+                ('lerobot.common.policies.smolvla.modeling_smolvla', 'SmolVLAPolicy'),
+            ),
+        }
+        if name not in policy_imports:
             raise NotImplementedError(
                 f'Policy with name {name} is not implemented.')
+
+        import_errors = []
+        for module_name, class_name in policy_imports[name]:
+            try:
+                module = importlib.import_module(module_name)
+                return getattr(module, class_name)
+            except (ImportError, AttributeError) as e:
+                import_errors.append(f'{module_name}.{class_name}: {e}')
+
+        raise ImportError(
+            f'Unable to import LeRobot policy class for {name}. Tried: '
+            + '; '.join(import_errors))
 
     @staticmethod
     def get_available_policies() -> list[str]:

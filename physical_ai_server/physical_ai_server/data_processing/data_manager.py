@@ -38,12 +38,10 @@ from huggingface_hub import (
     upload_large_folder
 )
 from huggingface_hub.errors import LocalTokenNotFoundError
-from lerobot.datasets.utils import DEFAULT_FEATURES
 from nav_msgs.msg import Odometry
 import numpy as np
 from physical_ai_interfaces.msg import TaskStatus
 from physical_ai_server.data_processing.data_converter import DataConverter
-from physical_ai_server.data_processing.lerobot_dataset_wrapper import LeRobotDatasetWrapper
 from physical_ai_server.data_processing.progress_tracker import (
     HuggingFaceProgressTqdm
 )
@@ -53,6 +51,34 @@ from physical_ai_server.device_manager.storage_checker import StorageChecker
 import requests
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory
+
+
+FALLBACK_DEFAULT_FEATURES = {
+    'timestamp': {'dtype': 'float32', 'shape': (1,), 'names': None},
+    'frame_index': {'dtype': 'int64', 'shape': (1,), 'names': None},
+    'episode_index': {'dtype': 'int64', 'shape': (1,), 'names': None},
+    'index': {'dtype': 'int64', 'shape': (1,), 'names': None},
+    'task_index': {'dtype': 'int64', 'shape': (1,), 'names': None},
+}
+
+
+def get_lerobot_default_features():
+    try:
+        from lerobot.datasets.utils import DEFAULT_FEATURES
+        return DEFAULT_FEATURES.copy()
+    except (ImportError, AttributeError) as exc:
+        print(
+            'Could not import lerobot.datasets.utils.DEFAULT_FEATURES; '
+            f'using local fallback features. error={exc}'
+        )
+        return FALLBACK_DEFAULT_FEATURES.copy()
+
+
+def get_lerobot_dataset_wrapper_class():
+    from physical_ai_server.data_processing.lerobot_dataset_wrapper import (
+        LeRobotDatasetWrapper
+    )
+    return LeRobotDatasetWrapper
 
 
 class DataManager:
@@ -458,7 +484,8 @@ class DataManager:
                 if self._check_dataset_exists(
                         self._save_repo_name,
                         self._save_path):
-                    self._lerobot_dataset = LeRobotDatasetWrapper(
+                    lerobot_dataset_wrapper_cls = get_lerobot_dataset_wrapper_class()
+                    self._lerobot_dataset = lerobot_dataset_wrapper_cls(
                         self._save_repo_name,
                         self._save_path
                     )
@@ -483,9 +510,9 @@ class DataManager:
             self,
             repo_id,
             images,
-            joint_list) -> LeRobotDatasetWrapper:
+            joint_list):
 
-        features = DEFAULT_FEATURES.copy()
+        features = get_lerobot_default_features()
         for camera_name, image in images.items():
             features[f'observation.images.{camera_name}'] = {
                 'dtype': 'video',
@@ -504,7 +531,8 @@ class DataManager:
             'names': joint_list,
             'shape': (len(joint_list),)
         }
-        return LeRobotDatasetWrapper.create(
+        lerobot_dataset_wrapper_cls = get_lerobot_dataset_wrapper_class()
+        return lerobot_dataset_wrapper_cls.create(
                 repo_id=repo_id,
                 fps=self._task_info.fps,
                 features=features,
