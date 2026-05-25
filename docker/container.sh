@@ -3,6 +3,7 @@
 # Get the directory where the script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 CONTAINER_NAME="physical_ai_server_lipo"
+LIPO_PIP_PACKAGES="action-lipo osqp scipy numpy==1.26.4"
 
 # Function to display help
 show_help() {
@@ -18,6 +19,19 @@ show_help() {
     echo "  $0 start                Start container"
     echo "  $0 enter                Enter the running container"
     echo "  $0 stop                 Stop the container"
+}
+
+# Function to install LiPo runtime dependencies
+install_lipo_dependencies() {
+    echo "Installing LiPo runtime dependencies in ${CONTAINER_NAME}..."
+
+    if ! docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+        echo "Error: Container ${CONTAINER_NAME} is not running"
+        exit 1
+    fi
+
+    docker exec "$CONTAINER_NAME" bash -lc \
+        "python3 -m pip install --no-cache-dir ${LIPO_PIP_PACKAGES}"
 }
 
 # Function to start the container
@@ -37,6 +51,8 @@ start_container() {
 
     # Run docker-compose
     docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d
+
+    install_lipo_dependencies
 }
 
 # Function to enter the container
