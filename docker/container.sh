@@ -32,11 +32,11 @@ start_container() {
 
     echo "Starting physical_ai_server_lipo container..."
 
-    # Pull remote images when available; local lipo images can still be built below.
-    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" pull --ignore-pull-failures
+    # Pull the latest images
+    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" pull
 
     # Run docker-compose
-    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d --build
+    docker compose -f "${SCRIPT_DIR}/docker-compose.yml" up -d
 }
 
 # Function to enter the container

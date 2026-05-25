@@ -1,7 +1,7 @@
 services:
   physical_ai_manager_lipo:
     container_name: physical_ai_manager_lipo
-    image: robotis/physical-ai-manager-lipo:latest
+    image: robotis/physical-ai-manager:latest
     build:
       context: ../physical_ai_manager
       dockerfile: Dockerfile
@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
   physical_ai_server_lipo:
     container_name: physical_ai_server_lipo
-    image: robotis/physical-ai-server-lipo:latest
+    image: robotis/physical-ai-server:latest
     tty: true
     restart: no
     cap_add:
