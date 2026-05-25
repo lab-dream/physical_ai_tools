@@ -280,6 +280,9 @@ class PhysicalAIServer(Node):
         self.action_chunk_request_pending = False
         self.action_chunk_request_reason = ''
         self.action_chunk_request_count = 0
+        self.action_chunk_request_start_time = None
+        self.action_chunk_inference_thread = None
+        self.last_action_chunk_inference_latency_s = None
         self.last_published_action = None
         self._logged_action_publish_config = False
         self._logged_action_chunk_shape = False
@@ -410,10 +413,16 @@ class PhysicalAIServer(Node):
             self.action_publish_params = self._get_action_publish_parameters()
             self._reset_action_publish_state()
             self.policy_inference_hz = timer_frequency
-            if self.use_action_interpolation and self.use_early_inference:
-                self._request_action_chunk_inference(reason='initial')
 
-        self.timer_manager.start(timer_name=self.operation_mode)
+        if not (
+                self.operation_mode == 'inference' and
+                self.use_action_interpolation and
+                self.use_early_inference):
+            self.timer_manager.start(timer_name=self.operation_mode)
+        else:
+            self.get_logger().info(
+                'LiPo early inference scheduler: using action_publish async worker; '
+                'policy timer is disabled for chunk requests')
 
         if self.operation_mode == 'inference':
             if self.use_action_interpolation:
@@ -445,6 +454,7 @@ class PhysicalAIServer(Node):
             f'use_action_interpolation={self.use_action_interpolation}, '
             f'use_early_inference={self.use_early_inference} '
             '(controlled_by=use_lipo), '
+            f'early_inference_mode=async_prefetch, '
             f'early_inference_horizon='
             f'{self.lipo_params.get("blending_horizon", 0)}, '
             f'interpolation_method={self.interpolation_method}, '
@@ -456,6 +466,25 @@ class PhysicalAIServer(Node):
         for timer_name in ('inference', 'collection', 'action_publish'):
             if timer_name in self.timer_manager._timer:
                 self.timer_manager.stop(timer_name)
+
+    def _publish_ready_task_status(self):
+        current_status = TaskStatus()
+        if self.data_manager is not None:
+            current_status = self.data_manager.get_current_record_status()
+        current_status.phase = TaskStatus.READY
+        current_status.proceed_time = int(0)
+        current_status.total_time = int(0)
+        current_status.error = ''
+        self.communicator.publish_status(status=current_status)
+
+    def _finish_inference_operation(self):
+        self.get_logger().info('Finishing inference')
+        self.on_inference = False
+        self.on_recording = False
+        self._clear_action_chunk_request_if_current()
+        self._stop_operation_timers()
+        self._reset_action_publish_state()
+        self._publish_ready_task_status()
 
     def clear_parameters(self):
         if self.communicator is not None:
@@ -700,9 +729,7 @@ class PhysicalAIServer(Node):
         if not self.on_inference:
             return
         if self.use_action_interpolation and self.use_early_inference:
-            with self.action_publish_lock:
-                if not self.action_chunk_request_pending:
-                    return
+            return
 
         if not self.inference_lock.acquire(blocking=False):
             return
@@ -778,6 +805,8 @@ class PhysicalAIServer(Node):
                 self.communicator.publish_action(
                     joint_msg_datas=action_pub_msgs
                 )
+            if not self.on_inference:
+                return False
             current_status = self.data_manager.get_current_record_status()
             current_status.phase = TaskStatus.INFERENCING
             self.communicator.publish_status(status=current_status)
@@ -804,21 +833,55 @@ class PhysicalAIServer(Node):
             self.action_chunk_request_reason = reason
             self.action_chunk_request_count += 1
             request_count = self.action_chunk_request_count
+            self.action_chunk_request_start_time = time.perf_counter()
 
         self.get_logger().info(
             'Early inference request: '
             f'reason={reason}, request_count={request_count}')
+        self.action_chunk_inference_thread = threading.Thread(
+            target=self._run_action_chunk_inference_async,
+            args=(request_count, reason),
+            daemon=True)
+        self.action_chunk_inference_thread.start()
         return True
 
-    def _mark_action_chunk_request_locked(self, reason: str) -> bool:
-        if self.action_chunk_request_pending:
-            return False
-        self.action_chunk_request_pending = True
-        self.action_chunk_request_reason = reason
-        self.action_chunk_request_count += 1
-        return True
+    def _run_action_chunk_inference_async(self, request_count: int, reason: str):
+        if not self.on_inference:
+            self._clear_action_chunk_request_if_current(request_count)
+            return
+
+        if not self.inference_lock.acquire(blocking=False):
+            self.get_logger().warning(
+                'Early inference request skipped because another inference is running: '
+                f'reason={reason}, request_count={request_count}')
+            self._clear_action_chunk_request_if_current(request_count)
+            return
+
+        success = False
+        try:
+            success = bool(self._run_inference_once())
+        except Exception as e:
+            self.get_logger().error(
+                'Early inference worker failed: '
+                f'reason={reason}, request_count={request_count}, error={e}')
+        finally:
+            self.inference_lock.release()
+            if not success:
+                self._clear_action_chunk_request_if_current(request_count)
+
+    def _clear_action_chunk_request_if_current(self, request_count: int | None = None):
+        with self.action_publish_lock:
+            if request_count is not None and request_count != self.action_chunk_request_count:
+                return
+            self.action_chunk_request_pending = False
+            self.action_chunk_request_reason = ''
+            self.action_chunk_request_start_time = None
 
     def _update_action_chunk(self, action_chunk):
+        if not self.on_inference:
+            self._clear_action_chunk_request_if_current()
+            return
+
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         if action_chunk.ndim == 1:
             action_chunk = np.expand_dims(action_chunk, axis=0)
@@ -829,6 +892,11 @@ class PhysicalAIServer(Node):
         with self.action_publish_lock:
             self.latest_action_chunk = action_chunk
             self.latest_action_chunk_id += 1
+            if self.action_chunk_request_start_time is None:
+                latency_s = None
+            else:
+                latency_s = time.perf_counter() - self.action_chunk_request_start_time
+                self.last_action_chunk_inference_latency_s = latency_s
             if self.current_action_pva is None or not self.use_early_inference:
                 self.current_action_pva = action_pva
                 self.next_action_pva = None
@@ -843,6 +911,7 @@ class PhysicalAIServer(Node):
                 slot = 'next'
             self.action_chunk_request_pending = False
             self.action_chunk_request_reason = ''
+            self.action_chunk_request_start_time = None
 
         if not self._logged_action_chunk_shape:
             self.get_logger().info(
@@ -855,7 +924,17 @@ class PhysicalAIServer(Node):
         self.get_logger().info(
             'Action chunk buffered: '
             f'slot={slot}, chunk_id={self.latest_action_chunk_id}, '
-            f'chunk_size={action_chunk.shape[0]}, action_dim={action_chunk.shape[1]}')
+            f'chunk_size={action_chunk.shape[0]}, action_dim={action_chunk.shape[1]}, '
+            f'inference_latency_s={latency_s}')
+        if self.use_early_inference and latency_s is not None:
+            latency_budget_s = (
+                self._get_early_inference_horizon(action_chunk.shape[0]) *
+                self._get_policy_dt())
+            if latency_s > latency_budget_s:
+                self.get_logger().warning(
+                    'Early inference latency exceeded overlap budget: '
+                    f'latency_s={latency_s}, budget_s={latency_budget_s}. '
+                    'Increase lipo_blending_horizon or reduce inference latency.')
 
     def _build_action_pva(self, action_chunk: np.ndarray) -> np.ndarray:
         policy_dt = self._get_policy_dt()
@@ -873,6 +952,11 @@ class PhysicalAIServer(Node):
         if self.policy_inference_hz > 0:
             return 1.0 / float(self.policy_inference_hz)
         return 1.0 / 30.0
+
+    def _get_action_publish_dt(self) -> float:
+        if self.action_publish_hz > 0:
+            return 1.0 / float(self.action_publish_hz)
+        return 1.0 / 100.0
 
     def _get_early_inference_horizon(self, chunk_size: int) -> int:
         horizon = int(self.lipo_params.get('blending_horizon', 0))
@@ -892,13 +976,12 @@ class PhysicalAIServer(Node):
             if self.current_action_pva is None:
                 if not self.action_chunk_request_pending:
                     request_reason = 'initial_wait'
-                    self._mark_action_chunk_request_locked(request_reason)
                 action = None
             else:
                 if self.last_action_publish_time is None:
                     elapsed_s = 0.0
                 else:
-                    elapsed_s = max(0.0, now - self.last_action_publish_time)
+                    elapsed_s = self._get_action_publish_dt()
                 self.last_action_publish_time = now
                 self.action_t_in_step += elapsed_s
 
@@ -912,11 +995,7 @@ class PhysicalAIServer(Node):
                     self.action_t_in_step)
 
         if request_reason:
-            self.get_logger().info(
-                'Early inference request: '
-                f'reason={request_reason}, '
-                f'step_counter={self.action_step_counter}, '
-                f'chunk_id={self.latest_action_chunk_id}')
+            self._request_action_chunk_inference(reason=request_reason)
 
         if action is None:
             return
@@ -940,8 +1019,9 @@ class PhysicalAIServer(Node):
         requested = False
 
         if (self.use_early_inference and
-                self.action_step_counter == prefetch_idx):
-            requested = self._mark_action_chunk_request_locked('prefetch')
+                self.action_step_counter == prefetch_idx and
+                not self.action_chunk_request_pending):
+            requested = True
 
         if self.action_step_counter > prefetch_idx:
             if self.next_action_pva is not None:
@@ -972,7 +1052,8 @@ class PhysicalAIServer(Node):
                 f'enabled={self.use_early_inference}, '
                 f'prefetch_idx={prefetch_idx}, '
                 f'blending_horizon={horizon}, '
-                f'policy_dt={self._get_policy_dt()}')
+                f'policy_dt={self._get_policy_dt()}, '
+                f'control_dt={self._get_action_publish_dt()}')
             self._logged_early_inference_config = True
 
         return requested
@@ -1231,6 +1312,8 @@ class PhysicalAIServer(Node):
                 if task_info.record_inference_mode:
                     self.on_recording = True
                 self.on_inference = True
+                if self.use_action_interpolation and self.use_early_inference:
+                    self._request_action_chunk_inference(reason='initial')
                 self.start_recording_time = time.perf_counter()
                 response.success = True
                 response.message = 'Inference started'
@@ -1241,13 +1324,15 @@ class PhysicalAIServer(Node):
                     response.message = 'Not currently recording'
                 else:
                     if request.command == SendCommand.Request.STOP:
-                        self.get_logger().info('Stopping recording')
-                        self.data_manager.record_stop()
                         if self.on_inference:
-                            self.on_inference = False
-                            self._stop_operation_timers()
+                            self.get_logger().info('Stopping inference')
+                            self._finish_inference_operation()
+                            response.message = 'Inference stopped'
+                        else:
+                            self.get_logger().info('Stopping recording')
+                            self.data_manager.record_stop()
+                            response.message = 'Recording stopped'
                         response.success = True
-                        response.message = 'Recording stopped'
 
                     elif request.command == SendCommand.Request.MOVE_TO_NEXT:
                         self.get_logger().info('Moving to next episode')
@@ -1266,9 +1351,11 @@ class PhysicalAIServer(Node):
 
                     elif request.command == SendCommand.Request.FINISH:
                         self.get_logger().info('Terminating all operations')
-                        self.data_manager.record_finish()
-                        self.on_inference = False
-                        self._stop_operation_timers()
+                        if self.on_inference:
+                            self._finish_inference_operation()
+                        else:
+                            self.data_manager.record_finish()
+                            self._stop_operation_timers()
                         response.success = True
                         response.message = 'All operations terminated'
 

@@ -46,7 +46,7 @@ Disable LiPo and restore the original ACT inference behavior:
 ros2 param set /physical_ai_server use_lipo false
 ```
 
-The parameter is read when inference starts, so set `use_lipo` before pressing Start Inference in the UI. Early inference is part of the LiPo path and is also controlled by `use_lipo`. If `use_lipo` is true but the selected policy is not ACT, LiPo and early inference are skipped.
+The parameter is read when inference starts, so set `use_lipo` before pressing Start Inference in the UI. Early inference is part of the LiPo path and is also controlled by `use_lipo`. When enabled, the action publisher starts asynchronous prefetch inference at `chunk_size - lipo_blending_horizon`, buffers the next optimized chunk, and swaps into it during the overlap window. If `use_lipo` is true but the selected policy is not ACT, LiPo and early inference are skipped.
 
 The LeRobot submodule is not modified in this repository. Docker builds install LeRobot first, then apply the ACT-only LiPo hook to the installed LeRobot source with `physical_ai_server/scripts/apply_lerobot_act_lipo_patch.py`.
 

@@ -109,13 +109,10 @@ class LiPoPostOptimizer:
         return restore_fn(optimized_np)
 
     def _solve(self, action_np: np.ndarray):
-        if self.prev_chunk is None or len(self.prev_chunk) < 4:
-            return self.optimizer.solve(action_np, action_np, 0)
+        if self.prev_chunk is None:
+            return action_np, {'status': 'no_previous_chunk'}
 
-        len_past_actions = min(
-            self.optimizer.B,
-            max(0, len(self.prev_chunk) - self.optimizer.JM)
-        )
+        len_past_actions = min(self.blending_horizon, len(self.prev_chunk))
         return self.optimizer.solve(action_np, self.prev_chunk, len_past_actions)
 
     def _ensure_optimizer(self, chunk_size: int, action_dim: int, dt: float):
